@@ -201,7 +201,8 @@ where
     }
 }
 
-fn prepare_fqn_and_credential(connection_string: &str, options: &ServiceBusClientOptions) -> Result<(String, ServiceBusTokenCredential), Error> {
+/// The namespace, credential and custom endpoint of a connection string; an endpoint port is where it connects.
+fn prepare_fqn_and_credential(connection_string: &str, options: &ServiceBusClientOptions) -> Result<(String, ServiceBusTokenCredential, Option<Url>), Error> {
     let connection_string_properties =
             ServiceBusConnectionStringProperties::parse(connection_string)?;
         validate_connection_string_properties(&connection_string_properties, "connection_string")?;
@@ -245,8 +246,15 @@ fn prepare_fqn_and_credential(connection_string: &str, options: &ServiceBusClien
         let token_credential: ServiceBusTokenCredential =
             ServiceBusTokenCredential::SharedAccessCredential(shared_access_credential);
 
+    let custom_endpoint_address = options.custom_endpoint_address.clone().or_else(|| {
+        connection_string_properties
+            .endpoint()
+            .filter(|endpoint| endpoint.port().is_some())
+            .cloned()
+    });
+
     let fqn = fully_qualified_namespace.unwrap_or("").to_string();
-    Ok((fqn, token_credential))
+    Ok((fqn, token_credential, custom_endpoint_address))
 }
 
 impl<C> ServiceBusConnection<C>
@@ -256,9 +264,10 @@ where
 {
     pub(crate) async fn new(
         connection_string: Cow<'_, str>,
-        options: ServiceBusClientOptions,
+        mut options: ServiceBusClientOptions,
     ) -> Result<Self, Error> {
-        let (fully_qualified_namespace, token_credential) = prepare_fqn_and_credential(connection_string.as_ref(), &options)?;
+        let (fully_qualified_namespace, token_credential, custom_endpoint_address) = prepare_fqn_and_credential(connection_string.as_ref(), &options)?;
+        options.custom_endpoint_address = custom_endpoint_address;
 
         Self::new_from_credential(fully_qualified_namespace, token_credential, options).await
             .map_err(Into::into)
@@ -289,9 +298,10 @@ where
     cfg_unsecured! {
         pub(crate) async fn new_unsecured(
             connection_string: Cow<'_, str>,
-            options: ServiceBusClientOptions,
+            mut options: ServiceBusClientOptions,
         ) -> Result<Self, Error> {
-            let (fully_qualified_namespace, token_credential) = prepare_fqn_and_credential(connection_string.as_ref(), &options)?;
+            let (fully_qualified_namespace, token_credential, custom_endpoint_address) = prepare_fqn_and_credential(connection_string.as_ref(), &options)?;
+            options.custom_endpoint_address = custom_endpoint_address;
 
             Self::new_unsecured_from_credential(fully_qualified_namespace, token_credential, options).await
                 .map_err(Into::into)
@@ -361,4 +371,57 @@ fn validate_connection_string_properties(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE";
+
+    /// The namespace and custom endpoint a connection string yields with `options`.
+    fn prepare(
+        connection_string: &str,
+        options: &ServiceBusClientOptions,
+    ) -> (String, Option<Url>) {
+        let (namespace, _, custom_endpoint) =
+            prepare_fqn_and_credential(connection_string, options).unwrap();
+        (namespace, custom_endpoint)
+    }
+
+    /// An endpoint with a port is connected to at that port, while the namespace stays its host.
+    #[test]
+    fn endpoint_port_becomes_the_custom_endpoint() {
+        let (namespace, custom_endpoint) = prepare(
+            &format!("Endpoint=sb://127.0.0.1:32806;{KEY}"),
+            &ServiceBusClientOptions::default(),
+        );
+        assert_eq!(namespace, "127.0.0.1");
+        let custom_endpoint = custom_endpoint.expect("custom endpoint");
+        assert_eq!(custom_endpoint.host_str(), Some("127.0.0.1"));
+        assert_eq!(custom_endpoint.port(), Some(32806));
+    }
+
+    /// An endpoint without a port is connected to through its namespace.
+    #[test]
+    fn endpoint_without_port_sets_no_custom_endpoint() {
+        let (namespace, custom_endpoint) = prepare(
+            &format!("Endpoint=sb://namespace.servicebus.windows.net/;{KEY}"),
+            &ServiceBusClientOptions::default(),
+        );
+        assert_eq!(namespace, "namespace.servicebus.windows.net");
+        assert_eq!(custom_endpoint, None);
+    }
+
+    /// A custom endpoint in the options takes precedence over the endpoint's port.
+    #[test]
+    fn options_custom_endpoint_wins_over_endpoint_port() {
+        let options = ServiceBusClientOptions {
+            custom_endpoint_address: Some(Url::parse("sb://proxy.example.com:5671").unwrap()),
+            ..Default::default()
+        };
+        let (_, custom_endpoint) =
+            prepare(&format!("Endpoint=sb://127.0.0.1:32806;{KEY}"), &options);
+        assert_eq!(custom_endpoint, options.custom_endpoint_address);
+    }
 }
