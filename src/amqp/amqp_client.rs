@@ -315,18 +315,27 @@ cfg_unsecured! {
 
 macro_rules! format_connection_endpoint_impl {
     ($host:ident, $transport_type:ident, $custom_endpoint:ident, $service_endpoint:ident, $url_scheme_fn:ident) => {
-        match $custom_endpoint.as_ref().and_then(|url| url.host_str()) {
-            Some(custom_host) => match $transport_type {
+        match $custom_endpoint.as_ref().and_then(|url| {
+            url.host_str().map(|host| match url.port() {
+                Some(port) => format!("{}:{}", host, port),
+                None => host.to_string(),
+            })
+        }) {
+            Some(custom_authority) => match $transport_type {
                 #[cfg(not(target_arch = "wasm32"))]
                 ServiceBusTransportType::AmqpTcp => {
-                    let addr = format!("{}://{}", $transport_type.$url_scheme_fn(), custom_host);
+                    let addr = format!(
+                        "{}://{}",
+                        $transport_type.$url_scheme_fn(),
+                        custom_authority
+                    );
                     Url::parse(&addr)
                 }
                 ServiceBusTransportType::AmqpWebSocket => {
                     let addr = format!(
                         "{}://{}{}",
                         $transport_type.$url_scheme_fn(),
-                        custom_host,
+                        custom_authority,
                         AmqpConnectionScope::WEB_SOCKETS_PATH_SUFFIX
                     );
                     Url::parse(&addr)
@@ -371,4 +380,84 @@ cfg_unsecured! {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    fn connection_endpoint(transport_type: ServiceBusTransportType, custom: Option<&str>) -> Url {
+        let service_endpoint = format_service_endpoint("namespace.servicebus.windows.net").unwrap();
+        let custom = custom.map(|custom| Url::parse(custom).unwrap());
+        format_connection_endpoint(
+            "namespace.servicebus.windows.net",
+            transport_type,
+            custom,
+            &service_endpoint,
+        )
+        .unwrap()
+    }
+
+    /// Without a custom endpoint the connection goes to the service endpoint.
+    #[test]
+    fn connection_endpoint_defaults_to_service_endpoint() {
+        let endpoint = connection_endpoint(ServiceBusTransportType::AmqpTcp, None);
+        assert_eq!(endpoint.scheme(), "amqps");
+        assert_eq!(
+            endpoint.host_str(),
+            Some("namespace.servicebus.windows.net")
+        );
+        assert_eq!(endpoint.port(), None);
+    }
+
+    /// A custom endpoint's port is where the connection goes.
+    #[test]
+    fn custom_endpoint_keeps_its_port() {
+        let endpoint = connection_endpoint(
+            ServiceBusTransportType::AmqpTcp,
+            Some("sb://localhost:5673"),
+        );
+        assert_eq!(endpoint.scheme(), "amqps");
+        assert_eq!(endpoint.host_str(), Some("localhost"));
+        assert_eq!(endpoint.port(), Some(5673));
+    }
+
+    /// A custom endpoint without a port leaves the transport's default port.
+    #[test]
+    fn custom_endpoint_without_port_uses_the_default() {
+        let endpoint =
+            connection_endpoint(ServiceBusTransportType::AmqpTcp, Some("sb://localhost"));
+        assert_eq!(endpoint.host_str(), Some("localhost"));
+        assert_eq!(endpoint.port(), None);
+    }
+
+    /// Over web sockets the custom endpoint keeps its port and gets the web socket path.
+    #[test]
+    fn custom_web_socket_endpoint_keeps_its_port() {
+        let endpoint = connection_endpoint(
+            ServiceBusTransportType::AmqpWebSocket,
+            Some("sb://localhost:8443"),
+        );
+        assert_eq!(endpoint.scheme(), "wss");
+        assert_eq!(endpoint.host_str(), Some("localhost"));
+        assert_eq!(endpoint.port(), Some(8443));
+        assert_eq!(
+            endpoint.path(),
+            AmqpConnectionScope::WEB_SOCKETS_PATH_SUFFIX
+        );
+    }
+
+    /// The unsecured connection to a custom endpoint keeps its port.
+    #[cfg(feature = "unsecured")]
+    #[test]
+    fn unsecured_custom_endpoint_keeps_its_port() {
+        let service_endpoint = format_unsecured_service_endpoint("localhost").unwrap();
+        let endpoint = format_unsecured_connection_endpoint(
+            "localhost",
+            ServiceBusTransportType::AmqpTcp,
+            Some(Url::parse("sb://127.0.0.1:32806").unwrap()),
+            &service_endpoint,
+        )
+        .unwrap();
+        assert_eq!(endpoint.scheme(), "amqp");
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+        assert_eq!(endpoint.port(), Some(32806));
+    }
+}
